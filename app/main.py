@@ -73,3 +73,21 @@ async def upload_file(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     return {"message": "SmartProposal Backend is running"}
+
+@app.post("/feedback")
+async def submit_feedback(feedback: str):
+    """
+    Collects lightweight user feedback for UI experience evaluation
+    """
+
+    if feedback not in ["good", "average", "bad"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid feedback value"
+        )
+
+    # فعلاً فقط لاگ می‌کنیم (برای تست UX کافیه)
+    return {
+        "message": "بازخورد شما با موفقیت ثبت شد",
+        "feedback": feedback
+    }
