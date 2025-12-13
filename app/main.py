@@ -1,8 +1,9 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import shutil
-from fastapi.middleware.cors import CORSMiddleware
+
 
 origins = [
     "http://localhost:3000"
@@ -17,24 +18,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
 
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """
     Receives an ODT file and saves it to server
+    Handles server and validation errors properly
     """
-    if not file.filename.endswith(".odt"):
-        return JSONResponse(content={"error": "Only .odt files allowed"}, status_code=400)
 
-    save_path = UPLOAD_DIR / file.filename
-    with save_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
 
-    # Placeholder response
-    return {"filename": file.filename, "message": "File uploaded successfully, analysis pending."}
+    if not file:
+        raise HTTPException(
+            status_code=400,
+            detail="هیچ فایلی ارسال نشده است"
+        )
+
+
+    if not file.filename.lower().endswith(".odt"):
+        raise HTTPException(
+            status_code=400,
+            detail="فقط فایل با فرمت ODT مجاز است"
+        )
+
+    try:
+        save_path = UPLOAD_DIR / file.filename
+
+
+        with save_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "filename": file.filename,
+                "message": "فایل با موفقیت آپلود شد"
+            }
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=500,
+            detail="خطای داخلی سرور. لطفاً بعداً دوباره تلاش کنید"
+        )
+
 
 
 @app.get("/")
