@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, Tuple
+
+
+@dataclass
+class WeightedRules:
+    # Metric weights (configurable). They do NOT need to sum to 1; we normalize.
+    # Add/remove metrics by editing these fields (and the compute_total_score function).
+    w_coverage: float = 0.35
+    w_correctness: float = 0.40
+    w_completeness: float = 0.25
+
+    # Decision thresholds on total_score [0..100]
+    accept_threshold: float = 85.0
+    revision_threshold: float = 60.0
+
+    # Optional hard guardrails
+    max_missing_in_ref: int = 0        # citations in text missing in reference list
+    max_incomplete_refs: int = 3       # incomplete refs allowed
+
+
+DEFAULT_RULES_PATH = "weighted_rules.json"
+
+
+class RulesStore:
+    """Simple JSON rules storage for weights and thresholds."""
+
+    def __init__(self, path: str = DEFAULT_RULES_PATH) -> None:
+        self.path = path
+
+    def load(self) -> WeightedRules:
+        if not os.path.exists(self.path):
+            rules = WeightedRules()
+            self.save(rules)
+            return rules
+
+        with open(self.path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+
+        return WeightedRules(
+            w_coverage=float(d.get("w_coverage", 0.35)),
+            w_correctness=float(d.get("w_correctness", 0.40)),
+            w_completeness=float(d.get("w_completeness", 0.25)),
+            accept_threshold=float(d.get("accept_threshold", 85.0)),
+            revision_threshold=float(d.get("revision_threshold", 60.0)),
+            max_missing_in_ref=int(d.get("max_missing_in_ref", 0)),
+            max_incomplete_refs=int(d.get("max_incomplete_refs", 3)),
+        )
+
+    def save(self, rules: WeightedRules) -> None:
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(asdict(rules), f, ensure_ascii=False, indent=2)
+
+    def update(self, **patch: Any) -> WeightedRules:
+        rules = self.load()
+        for k, v in patch.items():
+            if not hasattr(rules, k):
+                raise ValueError(f"Unknown rule field: {k}")
+            setattr(rules, k, type(getattr(rules, k))(v))
+        self.save(rules)
+        return rules
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def compute_total_score(
+    metrics: Dict[str, float],
+    rules: WeightedRules,
+) -> Dict[str, Any]:
+    """
+    Compute a normalized weighted total_score in [0..100].
+
+    Expected metrics (0..100 each):
+      - coverage
+      - correctness
+      - completeness
+    """
+    # Read weights
+    weights = {
+        "coverage": rules.w_coverage,
+        "correctness": rules.w_correctness,
+        "completeness": rules.w_completeness,
+    }
+
+    # Normalize weights safely
+    w_sum = sum(max(0.0, w) for w in weights.values())
+    if w_sum <= 0:
+        # Fallback: equal weights if config is broken
+        for k in weights:
+            weights[k] = 1.0
+        w_sum = 3.0
+
+    # Weighted sum
+    total = 0.0
+    used = {}
+    for name, w in weights.items():
+        m = float(metrics.get(name, 0.0))
+        m = _clip(m, 0.0, 100.0)
+        wn = max(0.0, w) / w_sum
+        total += wn * m
+        used[name] = {"metric": m, "weight": w, "weight_normalized": round(wn, 6)}
+
+    return {"total_score": round(_clip(total, 0.0, 100.0), 2), "components": used}
+
+
+def categorize(
+    total_score: float,
+    rules: WeightedRules,
+    *,
+    missing_in_ref_count: int = 0,
+    incomplete_refs_count: int = 0,
+) -> Tuple[str, str]:
+    """
+    Categorize into:
+      - ACCEPT
+      - NEED_REVISION
+      - REJECT
+    Uses guardrails + thresholds.
+    """
+    # Guardrails first (optional but useful)
+    if missing_in_ref_count > rules.max_missing_in_ref:
+        return ("REJECT", f"Missing citations in reference list: {missing_in_ref_count} > {rules.max_missing_in_ref}")
+
+    if incomplete_refs_count > rules.max_incomplete_refs:
+        # Too many incomplete refs means revision even if score is good
+        return ("NEED_REVISION", f"Incomplete references: {incomplete_refs_count} > {rules.max_incomplete_refs}")
+
+    # Threshold-based category
+    if total_score >= rules.accept_threshold:
+        return ("ACCEPT", f"total_score {total_score:.2f} >= accept_threshold {rules.accept_threshold:.2f}")
+    if total_score >= rules.revision_threshold:
+        return ("NEED_REVISION", f"total_score {total_score:.2f} >= revision_threshold {rules.revision_threshold:.2f}")
+    return ("REJECT", f"total_score {total_score:.2f} < revision_threshold {rules.revision_threshold:.2f}")
+
+
+def evaluate(
+    metrics: Dict[str, float],
+    *,
+    missing_in_ref_count: int = 0,
+    incomplete_refs_count: int = 0,
+    rules_path: str = DEFAULT_RULES_PATH,
+) -> Dict[str, Any]:
+    """
+    End-to-end evaluation: total_score + category.
+    """
+    store = RulesStore(rules_path)
+    rules = store.load()
+
+    sc = compute_total_score(metrics, rules)
+    cat, reason = categorize(
+        sc["total_score"],
+        rules,
+        missing_in_ref_count=missing_in_ref_count,
+        incomplete_refs_count=incomplete_refs_count,
+    )
+
+    return {
+        "total_score": sc["total_score"],
+        "category": cat,
+        "reason": reason,
+        "components": sc["components"],
+        "rules": asdict(rules),
+        "inputs": {
+            "metrics": metrics,
+            "missing_in_ref_count": missing_in_ref_count,
+            "incomplete_refs_count": incomplete_refs_count,
+        },
+    }
+
+
+if __name__ == "__main__":
+    # CLI demo (kept minimal):
+    #   python weighted_scoring_and_decision.py
+    #
+    # You can also edit weights/thresholds by modifying weighted_rules.json.
+
+    demo_metrics = {
+        "coverage": 78.0,
+        "correctness": 82.0,
+        "completeness": 65.0,
+    }
+
+    out = evaluate(
+        demo_metrics,
+        missing_in_ref_count=0,
+        incomplete_refs_count=2,
+    )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
